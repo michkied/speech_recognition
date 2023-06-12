@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import time
 import uuid
+import numpy as np
 
 try:
     import requests
@@ -36,7 +37,7 @@ from urllib.error import URLError, HTTPError
 from .audio import AudioData, get_flac_converter
 from .exceptions import (
     RequestError,
-    TranscriptionFailed, 
+    TranscriptionFailed,
     TranscriptionNotReady,
     UnknownValueError,
     WaitTimeoutError,
@@ -53,6 +54,110 @@ class AudioSource(object):
 
     def __exit__(self, exc_type, exc_value, traceback):
         raise NotImplementedError("this is an abstract class")
+
+
+class Speaker(AudioSource):
+    def __init__(self, sample_rate=None, chunk_size=1024):
+        assert sample_rate is None or (isinstance(sample_rate, int) and sample_rate > 0), "Sample rate must be None or a positive integer"
+        assert isinstance(chunk_size, int) and chunk_size > 0, "Chunk size must be a positive integer"
+
+        # set up PyAudio
+        self.pyaudio_module = self.get_pyaudio()
+        audio = self.pyaudio_module.PyAudio()
+        try:
+            # Get default WASAPI info
+            wasapi_info = audio.get_host_api_info_by_type(self.pyaudio_module.paWASAPI)
+        except OSError:
+            audio.terminate()
+            exit()
+
+        # Get default WASAPI speakers
+        speakers = audio.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+        if not speakers["isLoopbackDevice"]:
+            for loopback in audio.get_loopback_device_info_generator():
+                """
+                Try to find loopback device with same name(and [Loopback suffix]).
+                Unfortunately, this is the most adequate way at the moment.
+                """
+                if speakers["name"] in loopback["name"]:
+                    speakers = loopback
+                    break
+            else:
+                print("Default loopback output device not found.\n\nRun `python -m pyaudiowpatch` to check available devices.\nExiting...\n")
+                audio.terminate()
+                exit()
+
+        audio.terminate()
+
+        self.speakers = speakers
+        self.device_index = speakers['index']
+        self.format = self.pyaudio_module.paInt16  # 16-bit int sampling
+        self.SAMPLE_WIDTH = self.pyaudio_module.get_sample_size(self.format)  # size of each sample
+        self.SAMPLE_RATE = int(speakers["defaultSampleRate"])  # sampling rate in Hertz
+        self.CHUNK = chunk_size  # number of frames stored in each buffer
+
+        self.audio = None
+        self.stream = None
+
+    @staticmethod
+    def get_pyaudio():
+        """
+        Imports the pyaudio module and checks its version. Throws exceptions if pyaudio can't be found or a wrong version is installed
+        """
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            raise AttributeError("Could not find PyAudio; check installation")
+        from distutils.version import LooseVersion
+        if LooseVersion(pyaudio.__version__) < LooseVersion("0.2.11"):
+            raise AttributeError("PyAudio 0.2.11 or later is required (found version {})".format(pyaudio.__version__))
+        return pyaudio
+
+    def __enter__(self):
+        assert self.stream is None, "This audio source is already inside a context manager"
+        self.audio = self.pyaudio_module.PyAudio()
+        print(self.speakers)
+        try:
+            self.stream = Speaker.SpeakerStream(
+                self.audio.open(
+                    format=self.format,
+                    channels=self.speakers["maxInputChannels"],
+                    rate=self.SAMPLE_RATE,
+                    frames_per_buffer=self.CHUNK,
+                    input=True,
+                    input_device_index=self.device_index
+                ),
+                self.speakers["maxInputChannels"]
+            )
+        except Exception:
+            self.audio.terminate()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self.stream.close()
+        finally:
+            self.stream = None
+            self.audio.terminate()
+
+    class SpeakerStream(object):
+        def __init__(self, pyaudio_stream, channels):
+            self.pyaudio_stream = pyaudio_stream
+            self.channels = channels
+
+        def read(self, size):
+            data = self.pyaudio_stream.read(size, exception_on_overflow=False)
+            data_array = np.fromstring(data, dtype='int16')
+            channel0 = data_array[0::self.channels]
+            return channel0.tostring()
+
+        def close(self):
+            try:
+                # sometimes, if the stream isn't stopped, closing the stream throws an exception
+                if not self.pyaudio_stream.is_stopped():
+                    self.pyaudio_stream.stop_stream()
+            finally:
+                self.pyaudio_stream.close()
 
 
 class Microphone(AudioSource):
@@ -105,7 +210,7 @@ class Microphone(AudioSource):
         Imports the pyaudio module and checks its version. Throws exceptions if pyaudio can't be found or a wrong version is installed
         """
         try:
-            import pyaudio
+            import pyaudiowpatch as pyaudio
         except ImportError:
             raise AttributeError("Could not find PyAudio; check installation")
         from distutils.version import LooseVersion
@@ -1152,7 +1257,7 @@ class Recognizer(AudioSource):
             aws_secret_access_key=secret_access_key,
             region_name=region)
 
-        s3 = boto3.client('s3', 
+        s3 = boto3.client('s3',
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
             region_name=region)
@@ -1202,7 +1307,7 @@ class Recognizer(AudioSource):
                 else:
                     # Some other error happened, so re-raise.
                     raise
-            
+
             job = status['TranscriptionJob']
             if job['TranscriptionJobStatus'] in ['COMPLETED'] and 'TranscriptFileUri' in job['Transcript']:
 
@@ -1231,7 +1336,7 @@ class Recognizer(AudioSource):
 
                     return transcript, confidence
             elif job['TranscriptionJobStatus'] in ['FAILED']:
-            
+
                 # Delete job.
                 try:
                     transcribe.delete_transcription_job(TranscriptionJobName=job_name) # cleanup
@@ -1241,7 +1346,7 @@ class Recognizer(AudioSource):
 
                 # Delete S3 file.
                 s3.delete_object(Bucket=bucket_name, Key=filename)
-                
+
                 exc = TranscriptionFailed()
                 exc.job_name = None
                 exc.file_key = None
@@ -1502,12 +1607,12 @@ class Recognizer(AudioSource):
             return result["text"]
 
     recognize_whisper_api = whisper.recognize_whisper_api
-            
+
     def recognize_vosk(self, audio_data, language='en'):
         from vosk import Model, KaldiRecognizer
-        
+
         assert isinstance(audio_data, AudioData), "Data must be audio data"
-        
+
         if not hasattr(self, 'vosk_model'):
             if not os.path.exists("model"):
                 return "Please download the model from https://github.com/alphacep/vosk-api/blob/master/doc/models.md and unpack as 'model' in the current folder."
@@ -1515,10 +1620,10 @@ class Recognizer(AudioSource):
             self.vosk_model = Model("model")
 
         rec = KaldiRecognizer(self.vosk_model, 16000);
-        
+
         rec.AcceptWaveform(audio_data.get_raw_data(convert_rate=16000, convert_width=2));
         finalRecognition = rec.FinalResult()
-        
+
         return finalRecognition
 
 
