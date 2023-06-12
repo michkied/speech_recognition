@@ -19,10 +19,10 @@ import hashlib
 import hmac
 import time
 import uuid
-import numpy as np
 
 try:
     import requests
+    import numpy as np
 except (ModuleNotFoundError, ImportError):
     pass
 
