@@ -116,7 +116,6 @@ class Speaker(AudioSource):
     def __enter__(self):
         assert self.stream is None, "This audio source is already inside a context manager"
         self.audio = self.pyaudio_module.PyAudio()
-        print(self.speakers)
         try:
             self.stream = Speaker.SpeakerStream(
                 self.audio.open(
